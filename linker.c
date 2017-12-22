@@ -3,17 +3,24 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
-#include <netdb.h>
 #include <errno.h>
 #include <signal.h>
 #include <pthread.h>
+
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 
 #define MAX_ERROR_LENGTH 1000
 
 #define MAX_EVENT_ID_LENGTH 100
 #define MAX_INCOMING_REQUEST_SIZE 512
+
+#define RESEND_TIME 5
+
+#define REQUEST_RECV_PORT 5654
+#define RESPONSE_RECV_PORT 5655
 
 /* list head makes a list */
 typedef struct list_head {
@@ -27,7 +34,7 @@ typedef struct list {
 	struct list_head *end;
 }list_t;
 
-#define RESET_NODE(head)          do{ head->next = NULL; head->prev = NULL; \
+#define RESET_NODE(head)          do{ (head)->next = NULL; (head)->prev = NULL; \
                                     }while(0)
 #define ADD_NEXT(node, new)       do{ (new)->next = (node)->next; if ((new)->next != NULL) { \
                                       (new)->next->prev = new;} (new)->prev = node; \
@@ -41,14 +48,16 @@ typedef struct list {
                                       } if((node)->prev != NULL) { \
                                       (node)->prev->next = (node)->next; } RESET_NODE((node)); \
                                     }while(0)
-#define ADD_START(list, node)     do{ ADD_PREV((list)->start, node); (list)->start = node; \
-                                      if((list)->end == NULL) { (list)->end = node; } \
+#define ADD_START(list, node)     do{ if(IS_EMPTY(list)) { (list)->start = node; (list)->end = node; break;} \
+				      ADD_PREV((list)->start, node); (list)->start = node; \
                                     }while(0)
-#define ADD_END(list, node)       do{ ADD_NEXT(((list)->end), (node)); (list)->end = node; \
-                                      if((list)->start == NULL) { (list)->start = node; } \
+#define ADD_END(list, node)       do{ if(IS_EMPTY(list)) { (list)->end = node; (list)->start = node; break;} \
+				      ADD_NEXT(((list)->end), (node)); (list)->end = node; \
                                     }while(0)
 
-#define CAST_UP(ptr, type)        (type *)(ptr - (sizeof(type) - sizeof(list_head_t)))
+#define IS_EMPTY(list)            ((list)->start == NULL && (list)->end == NULL)
+
+#define CAST_OUT(ptr, type)       ((type *)((char*)ptr - (sizeof(type) - sizeof(list_head_t))))
 
 /************************************* Linker Global Definition ******************************/
 
@@ -74,6 +83,7 @@ typedef struct event_script {
 }event_script_t;
 
 /* poll request is a script execution request */
+/*
 typedef struct poll_request {
 	char *event_id;
 	struct sockaddr_in client_addr;
@@ -81,6 +91,7 @@ typedef struct poll_request {
 	// node holds poll_reqyest into a list
 	list_head_t node;
 }poll_request_t;
+*/
 
 /* request/response body */
 typedef struct reqresp_body {
@@ -91,16 +102,22 @@ typedef struct reqresp_body {
 
 /************************************* Linker Global Variables *******************************/
 
-// Holds the list of event that is being waited for 
+// Holds the list of events for which the linker is waiting 
 static list_t poll_event_list;
-// Holds the list of event and script mapping
+// Holds the list of event-script mappings
 static list_t event_script_map_list; 
-// Holds the list of event that need to be served 
+// Holds the list of events that has been requested
 static list_t request_queue;
+
+// Lock to sync poll_event_list
+static pthread_mutex_t poll_event_list_lock;
+
 // FFlag to stop threads
 int stop = 0;
 // port
-static int port = 9999;
+static int port = 0; 
+// port to consider while communicating with peer
+static int peer_port = 0; 
 // role
 static role_t role;
 
@@ -143,6 +160,8 @@ int init(void) {
 	request_queue.end = NULL;
 	event_script_map_list.start = NULL;
 	event_script_map_list.end = NULL;
+
+	pthread_mutex_init(&poll_event_list_lock, NULL);
 	return 0;
 }
 
@@ -151,8 +170,12 @@ void print_help(char *exec_name) {
 		\nopt: \n  \
 		-h \t\t: print help\n \
 		-r <role> \t: set role [deamon/waitfor] \n \
-		-p <port> \t: listen/request port\n",
-		exec_name
+		-p <port> \t: listen port\n \
+		-P <peerport> \t: peer port (port to send request/response)\n \
+		example:\n \
+		%s -p 5000 -r deamon  mysql_start:/usr/local/mysql_start_check.sh \n \
+                %s -p 4000 -P 5000 -r waitfor mysql:mysql_start \n",
+		exec_name, exec_name, exec_name
 	      );
 }
 
@@ -190,9 +213,11 @@ int register_event_script(char *arg) {
 	es_node->script_path = script;
 
 	// Add node to event script list
-	ADD_END(&event_script_map_list, &es_node->node);
+	RESET_NODE(&es_node->node);
 	if (event_script_map_list.start == NULL)
 		event_script_map_list.start = &es_node->node;
+	else
+		ADD_END(&event_script_map_list, &es_node->node);
 		
 	return 0;
 }
@@ -205,7 +230,7 @@ event_script_t * search_event_script(char *event_id) {
 		if (es_node == NULL) {
 			break;
 		}
-		es_body = CAST_UP(es_node, event_script_t);
+		es_body = CAST_OUT(es_node, event_script_t);
 		if (strcmp(es_body->event_id, event_id) == 0) {
 			return es_body;
 		}
@@ -224,7 +249,7 @@ void clean_event_script_map_list(void) {
 			break;
 		}
 		es_next_node = es_node->next;
-		es_body = CAST_UP(es_node, event_script_t);
+		es_body = CAST_OUT(es_node, event_script_t);
 		free(es_body->event_id);
 		free(es_body->script_path);
 		UNLINK_NODE(es_node);
@@ -241,6 +266,7 @@ int register_poll_event(char *arg) {
 	event_task_t *et_node;
 	struct hostent * he;
 	tofree = str = strdup(arg);
+	struct in_addr  addr;
 	while ((token = strsep(&str, ":"))) {
 		switch(index) {
 			case 0:
@@ -257,28 +283,53 @@ int register_poll_event(char *arg) {
 	free(tofree);
 
     	// get the service address
-    	he = gethostbyname(service);  
-    	if(he == NULL) {
-		set_error("service can't be resolved :%s\n", service);
-		return 1;
-	}
+    	do {
+		he = gethostbyname(service);  
+		if(he == NULL) {
+			set_error("service can't be resolved '%s'\n", service);
+			sleep(1);
+			continue;
+		}
 
+		if (he->h_addr_list[0] == NULL) { 
+			set_error("service can't be resolved '%s'\n", service);
+			sleep(1);
+			continue;
+		}
+	}while(0);
 	
 	// Create event script node
 	et_node = (event_task_t *)malloc(sizeof(event_task_t));
 	et_node->event_id = event;
 	memcpy(&(et_node->sa.sin_addr), he->h_addr_list[0], he->h_length);
 	et_node->sa.sin_family = AF_INET;
-	et_node->sa.sin_port = htons(port);
+	et_node->sa.sin_port = htons(peer_port);
 
 	// Add node to event script list
-	ADD_END(&poll_event_list, &et_node->node);
-	if (poll_event_list.start == NULL)
-		poll_event_list.start = &et_node->node;
+	ADD_END(&poll_event_list, &(et_node->node));
 		
+	printf("registered service '%s' as '%s:%d' for event '%s'\n", service, inet_ntoa(et_node->sa.sin_addr),
+									peer_port, event);
 
 	return 0;
 }
+
+// search event from poll event list
+event_task_t *search_poll_event(char *event_id) {
+	list_head_t *et_node;
+	event_task_t *et_body = NULL;
+	for(et_node = poll_event_list.start; et_node != poll_event_list.end;) {
+		if (et_node == NULL) {
+			break;
+		}
+		et_body = CAST_OUT(et_node, event_task_t);
+		if (strcmp(et_body->event_id, event_id) == 0) {
+			return et_body;
+		}
+	}
+	return NULL;
+}
+
 
 // clean the event script list
 void clean_poll_event_list(void) {
@@ -291,7 +342,7 @@ void clean_poll_event_list(void) {
 			break;
 		}
 		et_next_node = et_node->next;
-		et_body = CAST_UP(et_node, event_task_t);
+		et_body = CAST_OUT(et_node, event_task_t);
 		free(et_body->event_id);
 		UNLINK_NODE(et_node);
 		free(et_body);
@@ -300,8 +351,9 @@ void clean_poll_event_list(void) {
 }
 
 // add a poll request to request queue
+/*
 int add_poll_request(char *event_id, struct sockaddr_in *ca) {
-	poll_request_t *request_node;
+	poll_event_t *request_node;
 	event_script_t *es_node;
 
 	es_node = search_event_script(event_id);
@@ -322,9 +374,10 @@ int add_poll_request(char *event_id, struct sockaddr_in *ca) {
 		request_queue.end = &request_node->node;
 		
 	return 0;
-}
+}*/
 
 // clean the request queue
+/*
 void clean_poll_request_queue(void) {
 	list_head_t *poll_node;
 	list_head_t *poll_next_node;
@@ -335,14 +388,13 @@ void clean_poll_request_queue(void) {
 			break;
 		}
 		poll_next_node = poll_node->next;
-		poll_request = CAST_UP(poll_node, poll_request_t);
+		poll_request = CAST_OUT(poll_node, poll_request_t);
 		free(poll_request->event_id);
 		UNLINK_NODE(poll_node);
 		free(poll_request);
 		poll_node = poll_next_node;
 	}
-}
-
+}*/
 
 
 int cleanup(void) {
@@ -356,7 +408,13 @@ int parse_argument(int argc, char **argv) {
 	int c;
         char *cvalue = NULL;
         int index;
-	while ((c = getopt (argc, argv, "hr:p:")) != -1)
+
+	if (argc == 1) {
+		set_error("Not sufficient argument provided\n");
+		return 1;
+	}
+
+	while ((c = getopt (argc, argv, "hr:p:P:")) != -1){
     		switch (c) {
 			case 'h':
 				print_help(argv[0]);
@@ -365,9 +423,17 @@ int parse_argument(int argc, char **argv) {
         			if(strcmp(optarg, "deamon") == 0) {
 					printf("starting linker as deamon\n");
 					role = DEAMON;
-				} else if(strcmp(optarg, "deamon") == 0) {
+					if (port == 0)
+						port = REQUEST_RECV_PORT;
+					if (peer_port == 0)
+						peer_port = RESPONSE_RECV_PORT;
+				} else if(strcmp(optarg, "waitfor") == 0) {
 					printf("starting linker to waitfor\n");
 					role = WAITFOR;
+					if(port == 0)
+						port = RESPONSE_RECV_PORT;
+					if(peer_port == 0)
+						peer_port = REQUEST_RECV_PORT; 
 				}else {
 					set_error("invalid role: %s", optarg); 
 					return 1;
@@ -376,10 +442,15 @@ int parse_argument(int argc, char **argv) {
       			case 'p':
         			port = atoi(optarg);
         			break;
+			case 'P':
+				peer_port = atoi(optarg);
+				break;
 		        case '?':
 				if (optopt == 'r')
 			  		set_error("Option -%c requires an argument.\n", optopt);
 				else if (optopt == 'p')
+			  		set_error("Option -%c requires an argument.\n", optopt);
+				else if (optopt == 'P')
 			  		set_error("Option -%c requires an argument.\n", optopt);
 				else
 			  		set_error("Unknown option character `%c'.\n", optopt);
@@ -387,7 +458,9 @@ int parse_argument(int argc, char **argv) {
 		      	default:
 				abort();
 		}
-	for (index = optind; index < argc; index++)
+	}
+
+	for (index = optind; index < argc; index++){
 		switch(role) {
 			case DEAMON:
 				if(register_event_script(argv[index])) {
@@ -399,6 +472,7 @@ int parse_argument(int argc, char **argv) {
 					return 1;
 				}
 		}
+	}
 
 	return 0;
 }
@@ -406,78 +480,238 @@ int parse_argument(int argc, char **argv) {
 // initialize listen sockets
 int init_sockets(void) {
 	struct sockaddr_in serveraddr;
-	memset( &serveraddr, 0, sizeof(serveraddr) );
-	serveraddr.sin_family = AF_INET;
-	serveraddr.sin_port = htons( port );
-	serveraddr.sin_addr.s_addr = htonl( INADDR_ANY );
+	int optval;
+	struct timeval read_timeout;
 
-	if ( bind(fd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0 ) {
-                set_error("Failed to create listen socket at port %d : %s\n", strerror(errno));	
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) {
+    		set_error("ERROR opening socket");
+		return 1;
+	}
+	optval = 1;
+  	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, 
+			(const void *)&optval , sizeof(int));
+	
+	memset(&serveraddr, 0, sizeof(serveraddr) );
+	serveraddr.sin_family = AF_INET;
+	serveraddr.sin_port = htons(port);
+	serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+	read_timeout.tv_sec = 1;
+	read_timeout.tv_usec = 0; 
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &read_timeout, sizeof(read_timeout));
+
+	if (bind(fd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0 ) {
+                set_error("Failed to create listen socket at port %d: %s\n", port, strerror(errno));	
         	return 1;
     	}
 	return 0;
+}
+
+int send_reqresp(struct sockaddr_in sa, reqresp_body_t *request) {
+	int sockfd;
+	int resp = 0;
+
+	printf("Send\n");
+	
+	/* socket: create the socket */
+	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+
+	resp = sendto(sockfd, (char *)request, sizeof(reqresp_body_t), 0, 
+                                            (struct sockaddr *) &(sa), sizeof(sa));
+
+	close(sockfd);	
+	printf("Send done\n");
+
+	return resp;
+}
+
+// perform event request
+int perform_event_request(char *event_id, char *error) {
+	// search if the event exist 
+	event_script_t *event_script;
+	int status = 0;
+	event_script = search_event_script(event_id);
+	if (event_script == NULL) {
+		set_error_s(error, "no script is registered for event %s", event_id);
+		return 1;
+	}
+	// execute the event script
+	status = system(event_script->script_path);
+	if (status != 0) {
+		set_error_s(error, "execution status failed (%d) for script %s", status,
+ 								event_script->script_path);
+		return 1;
+	}
+	return 0;
+}
+
+// handle event response 
+int handle_request_response(char *event_id, char *error) {
+	event_task_t *event_task;
+	// LOCK
+	pthread_mutex_lock(&poll_event_list_lock);
+	// 
 }
 
 // poller polls for events to the corresponding services
 static void *
 poller(void *arg) {
 	sigset_t set;	
+	list_head_t *head;
+	event_task_t *event_task; 
+	reqresp_body_t request;
+	int err;
 
 	// block all signal
 	sigfillset(&set);
 	pthread_sigmask(SIG_SETMASK, &set, NULL);
-	
+
+	head = poll_event_list.start;
+	do {
+	   	// Lock poll event list lock
+	   	pthread_mutex_lock(&poll_event_list_lock);
+		if (head == NULL) {
+			if (IS_EMPTY(&poll_event_list)) {
+	   			pthread_mutex_unlock(&poll_event_list_lock);
+				break;
+			}
+			head = poll_event_list.start;
+			sleep(RESEND_TIME);
+		}
+		event_task = CAST_OUT(head, event_task_t);
+		
+		// Get the event from poll
+		head = head->next;
+
+		// Check if the event is already performed 
+		if (event_task->status) {
+			continue;
+		}
+
+	   	// Unlock poll event lock
+	   	pthread_mutex_unlock(&poll_event_list_lock);
+
+		// set the request
+		memset(&request, 0, sizeof(reqresp_body_t));
+		request.is_req = (unsigned int)1;
+		strcpy(request.event_id, event_task->event_id);
+		
+		// send request to the service
+		err = send_reqresp(event_task->sa, &request);
+		if (err <= 0) {
+			fprintf(stderr, "failed to sent event to %s error: %d\n", 
+                                              inet_ntoa(event_task->sa.sin_addr), err);
+		}
+	}while(!stop);
+
+	// set stop so that the reader stops once poller is done
+	stop = 1;	
+
 	return NULL;
 }
 
-// reader listen for response and request; on request it executes a poll request 
-// in current context
+// reader listen for response otherwise request; on request it executes a 
+// poll request in current context and send the response back to the requester;
+// while in response it checkes if the event exist in poll event list and 
+// delete the event from the list
 static void *
 reader(void *arg) {
-	char buffer[MAX_INCOMING_REQUEST_SIZE];
+	char buffer[sizeof(reqresp_body_t)];
 	static char error_string[MAX_ERROR_LENGTH];
 	int error = 0;
 	int length;
 	sigset_t set;
-	
+	struct sockaddr_in src_addr;
+	socklen_t len = sizeof(src_addr);
+	reqresp_body_t *reqresp;	
+
 	// block all signal
 	sigfillset(&set);
 	pthread_sigmask(SIG_SETMASK, &set, NULL);
 	
 	while(!stop) {
+		error = 0;
+		length = 0;
+		memset(buffer, 0, sizeof(reqresp_body_t));
 		do {
-			length = recvfrom( fd, buffer, sizeof(buffer) - 1, 0, NULL, 0 );
-			if ( length < 0 ) {
+			length = recvfrom( fd, buffer + length, sizeof(reqresp_body_t) - length, 
+								0, (struct sockaddr*)&src_addr, &len);
+			if(length < 0) {
+				error = errno;
 				set_error_s(error_string, "failed to receive: %s\n", strerror(errno));
 				break;
 			}
-			buffer[length] = '\0';
-			printf( "%d bytes: '%s'\n", length, buffer);
+			if(length < sizeof(reqresp_body_t)) {
+				continue;
+			}	
 		}while(0);
 		if (error) {
-			
+			if (error != ETIMEDOUT && error != EAGAIN)
+				fprintf(stderr, error_string);
+			continue;
 		}
+		// parse the request
+		reqresp = (reqresp_body_t *)malloc(sizeof(reqresp_body_t));
+		memcpy(reqresp, buffer, sizeof(reqresp_body_t));
+
+		switch(reqresp->is_req) {
+			// response
+			case 0:
+				// do not accept response as daemon
+				if(role == DEAMON) {
+					fprintf(stderr, "got response in deamon, check you ports\n");
+					break;
+				}
+				error = handle_request_response(reqresp->event_id, error_string);
+				if (error != 0) {
+					fprintf(stderr, "failed to perform request: %s\n", error_string);
+				}
+				break;
+			// request
+			default:
+				// do not accept request while waiting for
+				if(role == WAITFOR) {
+					fprintf(stderr, "got request while waiting for, check you ports\n");
+					break;
+				}
+				// Perform event check request
+				error = perform_event_request(reqresp->event_id, error_string);
+				if (error != 0) {
+					fprintf(stderr, "failed to perform request: %s\n", error_string);
+					break;
+				}
+				// If event check is successful send response
+				reqresp->is_req = 0;
+				error = send_reqresp(src_addr, reqresp);	
+				if (error <= 0) {
+					fprintf(stderr, "failed to send response to %s error %d\n",
+                                              				inet_ntoa(src_addr.sin_addr), error);
+				}
+				break;
+		}	
     	}
 	close(fd);
 	return NULL;
 }
 
 void term(int signum) {
-    stop = 1;
+	stop = 1;
 }
 
 int main(int argc, char *argv[]) {
 	struct sigaction action;
+	void *retval = NULL;
 
 	// initialize
 	if(init()) {
-		fprintf(stderr, "Error: Failed to initialize: \n\t%s\n", getError());
+		fprintf(stderr, "Error: Failed to initialize: \n%7s\n", getError());
 		exit(1); 
 	}
 
 	// parse arguments
 	if(parse_argument(argc, argv)) {
-		fprintf(stderr, "Error: Failed to parse argument: \n\t%s\n", getError());
+		fprintf(stderr, "Error: Failed to parse argument: \n%7s\n", getError());
 		cleanup();
 		print_help(argv[0]);
 		exit(1); 
@@ -485,7 +719,7 @@ int main(int argc, char *argv[]) {
 
 	// Create sockets
 	if(init_sockets()) {
-		fprintf(stderr, "Error: Failed to initialize the sockets: \n\t%s\n", getError());
+		fprintf(stderr, "Error: Failed to initialize the sockets: \n%7s\n", getError());
 		cleanup();
 		exit(1); 
 	}
@@ -500,6 +734,13 @@ int main(int argc, char *argv[]) {
     	memset(&action, 0, sizeof(struct sigaction));
     	action.sa_handler = term;
     	sigaction(SIGTERM, &action, NULL);
+    	sigaction(SIGINT, &action, NULL);
 
-	// 
-} 
+	// wait for thread to finish
+	pthread_join(reader_thread, &retval);
+	if(role == WAITFOR) {
+		pthread_join(poller_thread, &retval);
+	}
+	// Clean Up
+ 	printf("stopping linker\n"); 
+}
