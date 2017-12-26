@@ -17,7 +17,7 @@
 #define MAX_EVENT_ID_LENGTH 100
 #define MAX_INCOMING_REQUEST_SIZE 512
 
-#define RESEND_TIME 5
+#define RESEND_TIME 1
 
 #define REQUEST_RECV_PORT 5654
 #define RESPONSE_RECV_PORT 5655
@@ -44,9 +44,14 @@ typedef struct list {
                                       (new)->prev->next = new;} (new)->next = (node); \
                                       (node)->prev = new; \
                                     }while(0)
-#define UNLINK_NODE(node)         do{ if((node)->next != NULL) { (node)->next->prev = (node)->prev; \
-                                      } if((node)->prev != NULL) { \
-                                      (node)->prev->next = (node)->next; } RESET_NODE((node)); \
+#define UNLINK_NODE(node)         do{ \
+					if((node)->next != NULL) { \
+						(node)->next->prev = (node)->prev; \
+                                      	} \
+				      	if((node)->prev != NULL) { \
+                                      		(node)->prev->next = (node)->next; \
+				      	} \
+					RESET_NODE(node); \
                                     }while(0)
 #define ADD_START(list, node)     do{ if(IS_EMPTY(list)) { (list)->start = node; (list)->end = node; break;} \
 				      ADD_PREV((list)->start, node); (list)->start = node; \
@@ -214,10 +219,7 @@ int register_event_script(char *arg) {
 
 	// Add node to event script list
 	RESET_NODE(&es_node->node);
-	if (event_script_map_list.start == NULL)
-		event_script_map_list.start = &es_node->node;
-	else
-		ADD_END(&event_script_map_list, &es_node->node);
+	ADD_END(&event_script_map_list, &es_node->node);
 		
 	return 0;
 }
@@ -226,7 +228,7 @@ int register_event_script(char *arg) {
 event_script_t * search_event_script(char *event_id) {
 	list_head_t *es_node;
 	event_script_t *es_body = NULL;
-	for(es_node = event_script_map_list.start; es_node != event_script_map_list.end;) {
+	for(es_node = event_script_map_list.start;;) {
 		if (es_node == NULL) {
 			break;
 		}
@@ -234,6 +236,7 @@ event_script_t * search_event_script(char *event_id) {
 		if (strcmp(es_body->event_id, event_id) == 0) {
 			return es_body;
 		}
+		es_node = es_node->next;
 	}
 	return NULL;
 }
@@ -306,6 +309,7 @@ int register_poll_event(char *arg) {
 	et_node->sa.sin_port = htons(peer_port);
 
 	// Add node to event script list
+	RESET_NODE(&et_node->node);
 	ADD_END(&poll_event_list, &(et_node->node));
 		
 	printf("registered service '%s' as '%s:%d' for event '%s'\n", service, inet_ntoa(et_node->sa.sin_addr),
@@ -318,7 +322,7 @@ int register_poll_event(char *arg) {
 event_task_t *search_poll_event(char *event_id) {
 	list_head_t *et_node;
 	event_task_t *et_body = NULL;
-	for(et_node = poll_event_list.start; et_node != poll_event_list.end;) {
+	for(et_node = poll_event_list.start;;) {
 		if (et_node == NULL) {
 			break;
 		}
@@ -326,8 +330,23 @@ event_task_t *search_poll_event(char *event_id) {
 		if (strcmp(et_body->event_id, event_id) == 0) {
 			return et_body;
 		}
+		et_node = et_node->next;
 	}
 	return NULL;
+}
+
+// delete a poll event task from event list
+void delete_poll_event(event_task_t *et_body) {
+	// check if start
+	if(&(et_body->node)== poll_event_list.start) {
+		poll_event_list.start = et_body->node.next;
+	}
+	// check if end
+	if(&(et_body->node) == poll_event_list.end) {
+		poll_event_list.end = et_body->node.prev;
+	}
+	// unlink the node
+	UNLINK_NODE(&et_body->node); 
 }
 
 
@@ -512,8 +531,6 @@ int send_reqresp(struct sockaddr_in sa, reqresp_body_t *request) {
 	int sockfd;
 	int resp = 0;
 
-	printf("Send\n");
-	
 	/* socket: create the socket */
 	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 
@@ -521,7 +538,6 @@ int send_reqresp(struct sockaddr_in sa, reqresp_body_t *request) {
                                             (struct sockaddr *) &(sa), sizeof(sa));
 
 	close(sockfd);	
-	printf("Send done\n");
 
 	return resp;
 }
@@ -533,13 +549,13 @@ int perform_event_request(char *event_id, char *error) {
 	int status = 0;
 	event_script = search_event_script(event_id);
 	if (event_script == NULL) {
-		set_error_s(error, "no script is registered for event %s", event_id);
+		set_error_s(error, "no script is registered for event \'%s\'", event_id);
 		return 1;
 	}
 	// execute the event script
 	status = system(event_script->script_path);
 	if (status != 0) {
-		set_error_s(error, "execution status failed (%d) for script %s", status,
+		set_error_s(error, "execution status failed (%d) for script \'%s\'", status,
  								event_script->script_path);
 		return 1;
 	}
@@ -551,7 +567,26 @@ int handle_request_response(char *event_id, char *error) {
 	event_task_t *event_task;
 	// LOCK
 	pthread_mutex_lock(&poll_event_list_lock);
-	// 
+	
+	// find if event task exists
+	event_task = search_poll_event(event_id);
+	if (event_task == NULL) {
+		set_error_s(error, "unknown poll event \'%s\' (or already finished)", event_id);
+		pthread_mutex_unlock(&poll_event_list_lock);
+		return 1;
+	}
+
+	// delete event task from the poll event list
+	delete_poll_event(event_task);
+
+	fprintf(stdout, "event \'%s\' is done\n", event_task->event_id);
+	
+	// free resource
+	free(event_task->event_id);
+	free(event_task);
+
+	// UNLOCK 
+	pthread_mutex_unlock(&poll_event_list_lock);
 }
 
 // poller polls for events to the corresponding services
@@ -575,19 +610,21 @@ poller(void *arg) {
 			if (IS_EMPTY(&poll_event_list)) {
 	   			pthread_mutex_unlock(&poll_event_list_lock);
 				break;
+			}else {
+	   			pthread_mutex_unlock(&poll_event_list_lock);
+				sleep(RESEND_TIME);
+	   			pthread_mutex_lock(&poll_event_list_lock);
+				head = poll_event_list.start;
+				if (head == NULL) {
+	   				pthread_mutex_unlock(&poll_event_list_lock);
+					break;
+				}
 			}
-			head = poll_event_list.start;
-			sleep(RESEND_TIME);
 		}
 		event_task = CAST_OUT(head, event_task_t);
 		
 		// Get the event from poll
 		head = head->next;
-
-		// Check if the event is already performed 
-		if (event_task->status) {
-			continue;
-		}
 
 	   	// Unlock poll event lock
 	   	pthread_mutex_unlock(&poll_event_list_lock);
@@ -597,12 +634,14 @@ poller(void *arg) {
 		request.is_req = (unsigned int)1;
 		strcpy(request.event_id, event_task->event_id);
 		
-		// send request to the service
+		// send request to the service deamon
 		err = send_reqresp(event_task->sa, &request);
 		if (err <= 0) {
 			fprintf(stderr, "failed to sent event to %s error: %d\n", 
                                               inet_ntoa(event_task->sa.sin_addr), err);
 		}
+		fprintf(stdout, "send request for event \'%s\' to service %s:%u\n", event_task->event_id,
+					inet_ntoa(event_task->sa.sin_addr), event_task->sa.sin_port);
 	}while(!stop);
 
 	// set stop so that the reader stops once poller is done
@@ -663,9 +702,10 @@ reader(void *arg) {
 					fprintf(stderr, "got response in deamon, check you ports\n");
 					break;
 				}
+				fprintf(stdout, "received response for event \'%s\'\n", reqresp->event_id);
 				error = handle_request_response(reqresp->event_id, error_string);
 				if (error != 0) {
-					fprintf(stderr, "failed to perform request: %s\n", error_string);
+					fprintf(stderr, "failed to handle response: %s\n", error_string);
 				}
 				break;
 			// request
@@ -675,6 +715,7 @@ reader(void *arg) {
 					fprintf(stderr, "got request while waiting for, check you ports\n");
 					break;
 				}
+				fprintf(stdout, "received request for event \'%s\'\n", reqresp->event_id);
 				// Perform event check request
 				error = perform_event_request(reqresp->event_id, error_string);
 				if (error != 0) {
@@ -683,11 +724,17 @@ reader(void *arg) {
 				}
 				// If event check is successful send response
 				reqresp->is_req = 0;
+				// change port to listen port
+				src_addr.sin_port = htons(peer_port); 
 				error = send_reqresp(src_addr, reqresp);	
 				if (error <= 0) {
 					fprintf(stderr, "failed to send response to %s error %d\n",
                                               				inet_ntoa(src_addr.sin_addr), error);
 				}
+				fprintf(stdout, "send request response for event \'%s\' to service %s:%u\n",
+									reqresp->event_id,
+									inet_ntoa(src_addr.sin_addr),
+									src_addr.sin_port);
 				break;
 		}	
     	}
