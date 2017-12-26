@@ -1,12 +1,17 @@
 # linker
 
 Linker is a lightweight dependency resolver
-
+   
+### Compile
+```bash
+gcc linker.c -lpthread -o linker
+```
+  
 ### Help
 ```bash
 $ linker -h
 
-./linker [opt] [event:script].. [service:event]..
+linker [opt] [event:script].. [service:event]..
  
 opt: 
                 -h              : print help
@@ -17,27 +22,29 @@ opt:
                 ./linker -p 5000 -r deamon  mysql_start:/usr/local/mysql_start_check.sh 
                 ./linker -p 4000 -P 5000 -r waitfor mysql:mysql_start 
 ```
-
+   
 ### How to use
    
 #### Role:
-Linker use two roles:
-**1. Daemon**
-**2. wairtfor**
+Linker use two roles:  
+**1. Daemon**  
+**2. waitfor**  
   
-While running as daemon linker runs in background, to perform event check requests. On a event check request from dependent node, it executes corresponsing event check script and return response
+While running as **daemon** linker runs in background, to perform event check requests. On a event check request from dependent node, it executes corresponsing event check script and return response
 
-While running as waitfor linker runs in foreground, to halt execution till all the event has successfully occured
+While running as **waitfor** linker runs in foreground, to halt execution till all the event has successfully occured
   
+   
 #### Using with Docker Swarm:
-linker can be useful in docker env. Docker entrypoint script can use linker to request other container, in a docker swarm cluster.
-
-For a situation where **webserver** container is dependent on **mysql** container
-we can use docker swarm features to **link** and **depends_on**. Although **depends_on** check if the container has started, but not the application status.  
-
-to halt **webserver** from starting, `linter` can be used to waitfor **mysql** to start  
-
-to check **mysql** status locally, linker deamon can be started in **mysql** container as:
+  
+linker can be useful in a docker swarm environment. Docker entrypoint script can use linker to waitfor other service in different container
+  
+For a situation where `webserver` container depends on `mysql` container, we can use docker swarm features to `link` and `depends_on`. Although `depends_on` check if the container has started, but not the application status  
+  
+to halt `webserver` from starting, `linter` can be used to waitfor `mysql` to start  
+  
+##### Daemon
+to check `mysql` status locally, linker deamon can be started in `mysql` container as:
 ```bash
 linker -r deamon -p 5001 -P 5000 mysql_start:./mysql_start_check.sh
 ```
@@ -62,8 +69,8 @@ mysqladmin -h remote_server_ip -u$USER -p$PASS processlist
  fi
 ```
    
-   
-to make **webserver** container wait for mysql to start, linker can be started as waitfor in the entrypoint script:
+##### Waitfor 
+to make `webserver` container wait for mysql to start, linker can be started to waitfor in the entrypoint script:
 ```bash
 linker -r waitfor -p 5000 -P 5001 mysql:mysql_start
 ```
