@@ -35,11 +35,11 @@ While running as **daemon** linker runs in background, to perform event check re
 While running as **waitfor** linker runs in foreground, to halt execution till all the event has successfully occured
   
    
-#### Using with Docker Swarm:
+#### Using with Docker Compose:
   
-linker can be useful in a docker swarm environment. Docker entrypoint script can use linker to waitfor other service in different container
+linker can be useful in a docker compose environment. Docker entrypoint script can use linker to waitfor other service in different container
   
-For a situation where `webserver` container depends on `mysql` container, we can use docker swarm features to `link` and `depends_on`. Although `depends_on` check if the container has started, but not the application status  
+For a situation where `webserver` container depends on `mysql` container, we can use docker compose features to `link` and `depends_on`. Although `depends_on` check if the container has started, but not the application status  
   
 to halt `webserver` from starting, `linter` can be used to waitfor `mysql` to start  
   
